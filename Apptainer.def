@@ -1,0 +1,130 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.06-py3
+
+%arguments
+    TE_TAG=9d4e11eaa508383e35b510dc338e58b09c30be73
+    NEMO_RUN_TAG=v0.3.0
+    NEMO_VERSION=2.7.2
+
+%post
+    set -e
+
+    # ---- Core apt packages ----
+    apt-get update -qy
+    apt-get install -qyy \
+        libsndfile1 \
+        ffmpeg \
+        git \
+        curl \
+        pre-commit \
+        sudo \
+        gnupg \
+        unzip \
+        libsqlite3-dev
+    apt-get upgrade -qyy rsync
+    rm -rf /tmp/* || true; rm -rf /var/tmp/* || true
+
+    # ---- Build & install TransformerEngine from source ----
+    git clone --recurse-submodules https://github.com/NVIDIA/TransformerEngine.git /tmp/TransformerEngine
+    cd /tmp/TransformerEngine
+    git checkout --recurse-submodules {{ TE_TAG }}
+    patch -p1 < /workspace/bionemo2/patches/te.patch
+    PIP_CONSTRAINT= NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/usr/local/mpi \
+        pip --disable-pip-version-check --no-cache-dir install .
+    cd /
+    rm -rf /tmp/TransformerEngine
+
+    # ---- AWS CLI (source install, arch-agnostic) ----
+    cd /tmp
+    git clone --depth 1 --branch 2.27.59 https://github.com/aws/aws-cli.git
+    cd aws-cli
+    pip install .
+    cd /
+    rm -rf /tmp/aws-cli
+
+    # ---- NeMo Run ----
+    pip install hatchling urllib3
+    pip install nemo_run@git+https://github.com/NVIDIA/NeMo-Run.git@{{ NEMO_RUN_TAG }} \
+        --use-deprecated=legacy-resolver
+
+    # ---- Remove vulnerable onnx ----
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
+
+    # ---- UV ----
+    curl -fsSL https://github.com/astral-sh/uv/releases/download/0.6.13/uv-x86_64-unknown-linux-gnu.tar.gz \
+        | tar -xz -C /usr/local/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv
+
+    export UV_LINK_MODE=copy
+    export UV_COMPILE_BYTECODE=1
+    export UV_PYTHON_DOWNLOADS=never
+    export UV_SYSTEM_PYTHON=true
+    export UV_BREAK_SYSTEM_PACKAGES=1
+
+    mkdir -p /workspace/bionemo2
+    cd /workspace/bionemo2
+
+    # ---- Install nvidia-resiliency-ext ----
+    git clone https://github.com/NVIDIA/nvidia-resiliency-ext /tmp/nvidia-resiliency-ext
+    uv pip install /tmp/nvidia-resiliency-ext/
+    rm -rf /tmp/nvidia-resiliency-ext
+
+    # ---- Remove ngcsdk before install to avoid protobuf conflict ----
+    sed -i "/ngcsdk/d" /workspace/bionemo2/sub-packages/bionemo-core/pyproject.toml
+
+    # ---- Install bionemo packages + NeMo ----
+    uv pip install --no-build-isolation \
+        "nemo_toolkit[llm]=={{ NEMO_VERSION }}" \
+        /workspace/bionemo2/3rdparty/* \
+        /workspace/bionemo2/sub-packages/bionemo-core \
+        /workspace/bionemo2/sub-packages/bionemo-llm \
+        /workspace/bionemo2/sub-packages/bionemo-maxtoki \
+        /workspace/bionemo2/sub-packages/bionemo-testing \
+        scanpy \
+        -r /workspace/bionemo2/requirements-cve.txt \
+        -r /workspace/bionemo2/requirements-test.txt
+
+    # ---- Cleanup CVE packages ----
+    uv pip uninstall llama-index llama-index-core llama-index-legacy 2>/dev/null || true
+    uv pip install ngcsdk==3.64.3
+    uv pip uninstall bitsandbytes || true; uv pip install bitsandbytes==0.46.1
+    uv pip uninstall sqlitedict zstandard || true
+    uv pip install h11==0.16.0
+
+    # ---- Dev tools ----
+    uv pip install -r /workspace/bionemo2/requirements-dev.txt
+
+    rm -rf /workspace/bionemo2/3rdparty
+    rm -rf /tmp/* || true
+
+    chmod -R 777 /workspace/bionemo2/
+
+%files
+    ./patches/te.patch /workspace/bionemo2/patches/te.patch
+    ./3rdparty /workspace/bionemo2/3rdparty
+    ./sub-packages /workspace/bionemo2/sub-packages
+    ./requirements-cve.txt /workspace/bionemo2/requirements-cve.txt
+    ./requirements-test.txt /workspace/bionemo2/requirements-test.txt
+    ./requirements-dev.txt /workspace/bionemo2/requirements-dev.txt
+    ./LICENSE /workspace/bionemo2/LICENSE
+
+%environment
+    export UV_LINK_MODE=copy
+    export UV_COMPILE_BYTECODE=0
+    export UV_PYTHON_DOWNLOADS=never
+    export UV_SYSTEM_PYTHON=true
+    export UV_BREAK_SYSTEM_PACKAGES=1
+
+%labels
+    Author MaxToki
+    Version 2.6.3
+    BaseImage nvcr.io/nvidia/pytorch:25.06-py3
+
+%help
+    MaxToki dev container — temporal AI model for cell state progression.
+    Built from nvcr.io/nvidia/pytorch:25.06-py3 with NeMo 2.7.2 and TransformerEngine.
+
+    Run interactively:
+        apptainer shell --nv maxtoki-dev.sif
+
+    Run a script:
+        apptainer exec --nv maxtoki-dev.sif python my_script.py
